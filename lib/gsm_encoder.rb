@@ -66,6 +66,8 @@ module GSMEncoder
   BASIC_REGEX = /\A[ -_a-~#{Regexp.escape(CHAR_TABLE + BASIC_EXT_CHAR_TABLE.select {|c| c != 0}.join)}]*\Z/
   SPANISH_REGEX = /\A[ -_a-~#{Regexp.escape(CHAR_TABLE + SPANISH_EXT_CHAR_TABLE.select {|c| c != 0}.join)}]*\Z/
 
+  BASIC_CHAR_REGEX = /[#{ Regexp.escape(BASIC_EXT_CHAR_TABLE.select(&:nonzero?).join) }]{1}/
+
   # Verifies that this charset can represent every character in the Ruby
   # String.
   # @param str The String to verfiy
@@ -118,9 +120,32 @@ module GSMEncoder
     buffer
   end
 
+  # Public: This method splits an SMS's text into chunks based on GSM 03.38 specification
+  # assuming use of basic extension table, and considering support for Spanish characters
+  # by switching encoding to UCS-2 instead of 7-bit GSM.
+  #
+  # If UCS-2 encoding is used, then maximum message size is 70 characters.
+  # If characters from the basic extension table are used, then an escape character is appended
+  # to the message for each of those characters, and needs to be accounted for when splitting.
+  # If use_rolling_split: false; a naive (but fast) approach for splitting is used, assuming that
+  # the whole of special characters could be present in any of the chunks (and all of them).
+  # If use_rolling_split: true; a greedy approach is used, processing one word at a time, and
+  # fitting as many words as possible in each message.
+  def split_sms(sms, use_rolling_split: false)
+    if spanish_specific?(sms) # it means UCS-2 encoding will be used instead of 7-bit GSM
+      sms.gsub(/(.{1,70})( |\Z)/, "\\1\n").split("\n")
+    elsif use_rolling_split # do smarter split by processing one word at a time
+      rolling_split(sms)
+    else # we need to account for escape character among the 160 chars
+      safe_length = 160 - escaped_character_count(sms) # assume all special characters are in same partition
+      sms.gsub(/(.{1,#{safe_length}})( |\Z)/, "\\1\n").split("\n")
+    end
+  end
+
   module_function :can_encode?
   module_function :encode
   module_function :decode
+  module_function :split_sms
 
 private
 
@@ -136,5 +161,33 @@ private
     when SPANISH_CHARSET then SPANISH_EXT_CHAR_TABLE
     else BASIC_EXT_CHAR_TABLE
     end
+  end
+
+  def requires_escaping?(str)
+    str && (SPANISH_REGEX =~ str)
+  end
+
+  def spanish_specific?(str)
+    requires_escaping?(str) && !(BASIC_EXT_CHAR_TABLE =~ str)
+  end
+
+  def escaped_character_count(str)
+    str.scan(BASIC_CHAR_REGEX).size
+  end
+
+  def rolling_split(sms)
+    available = 160
+    current = 0
+    sms.split(/[\n\s]/).each_with_object([]) do |word, result|
+      # +2 to account for space between words - which is an extension table character also
+      length = word.size + escaped_character_count(word) + 2
+      available -= length
+      if available.negative?
+        current += 1
+        available = 160 - length
+      end
+
+      result[current] = [result[current], word].compact.join(" ")
+    end.compact
   end
 end
